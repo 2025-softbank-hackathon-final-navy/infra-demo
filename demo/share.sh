@@ -15,3 +15,5 @@ sudo crictl images | grep gateway
 # kubectl rollout restart deployment gateway
 
 # kubectl get svc 해서 나온 IP:PORT로 테스트 스크립트 돌려야함
+
+# kubectl logs -l app=gateway-server -f
