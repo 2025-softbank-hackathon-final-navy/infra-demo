@@ -15,7 +15,6 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"regexp"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -37,16 +36,13 @@ const (
 	RUNNER_IMAGE        = "localhost/py-runner:latest"
 	NAMESPACE           = "default"
 	REDIS_ADDR          = "redis-service:6379"
-	
-	CONCURRENCY_PER_POD = 5  
-	MAX_REPLICAS        = 10 
+	CONCURRENCY_PER_POD = 5
+	MAX_REPLICAS        = 10
 )
 
 var (
 	clientset      *kubernetes.Clientset
 	rdb            *redis.Client
-	lastActivity   sync.Map 
-	
 	validNameRegex = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 )
 
@@ -70,16 +66,17 @@ func main() {
 	clientset, _ = kubernetes.NewForConfig(config)
 
 	initRedis()
+	
 	go startIdleMonitor()
-	
+
 	gin.SetMode(gin.ReleaseMode)
-	r := gin.Default()
+	r := gin.New()
 	r.Use(gin.Recovery())
-	
+
 	r.POST("/run", handleDeployAndRun)
 	r.POST("/invoke/:name", handleInvoke)
 
-	log.Println("Serverless Gateway (Redis Distributed Counter) started on :80")
+	log.Println("Scalable Serverless Gateway started on :80")
 	r.Run(":80")
 }
 
@@ -87,9 +84,27 @@ func initRedis() {
 	rdb = redis.NewClient(&redis.Options{Addr: REDIS_ADDR, DB: 0})
 }
 
+func updateLastActivity(funcID string) {
+	ctx := context.Background()
+	key := fmt.Sprintf("last_active:%s", funcID)
+	rdb.Set(ctx, key, time.Now().Format(time.RFC3339), 0)
+}
+
+func getLastActivity(funcID string) time.Time {
+	ctx := context.Background()
+	val, err := rdb.Get(ctx, fmt.Sprintf("last_active:%s", funcID)).Result()
+	if err != nil {
+		return time.Time{} 
+	}
+	t, _ := time.Parse(time.RFC3339, val)
+	return t
+}
+
 func saveFunctionToRedis(req FunctionRequest, funcID string) error {
 	meta := FunctionMetadata{Name: funcID, Code: req.Code, Type: req.Type, Request: req.Request}
 	data, _ := json.Marshal(meta)
+
+	updateLastActivity(funcID)
 	return rdb.Set(context.Background(), fmt.Sprintf("func:%s", funcID), data, 0).Err()
 }
 
@@ -104,39 +119,22 @@ func getFunctionFromRedis(funcID string) (*FunctionMetadata, error) {
 func incRequestAndScale(funcID string) {
 	ctx := context.Background()
 	key := fmt.Sprintf("active:%s", funcID)
-
-	currentActive, err := rdb.Incr(ctx, key).Result()
-	if err != nil {
-		log.Printf("Redis INCR Error: %v", err)
-		return
-	}
-	
-	// 요청 처리 예상 시간보다 넉넉하게 잡음 
+	currentActive, _ := rdb.Incr(ctx, key).Result()
 	rdb.Expire(ctx, key, 1*time.Hour)
-
-	//  스케일업 판단
 	neededReplicas := int32(math.Ceil(float64(currentActive) / float64(CONCURRENCY_PER_POD)))
-	
-	if neededReplicas > 1 {
-		go scaleUpDeployment(funcID, neededReplicas)
-	}
+	if neededReplicas > 1 { go scaleUpDeployment(funcID, neededReplicas) }
 }
 
 func decRequest(funcID string) {
-	ctx := context.Background()
-	key := fmt.Sprintf("active:%s", funcID)
-	rdb.Decr(ctx, key)
+	rdb.Decr(context.Background(), fmt.Sprintf("active:%s", funcID))
 }
 
 func scaleUpDeployment(funcID string, needed int32) {
 	if needed > MAX_REPLICAS { needed = MAX_REPLICAS }
-
 	retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		deploy, err := clientset.AppsV1().Deployments(NAMESPACE).Get(context.TODO(), funcID, metav1.GetOptions{})
 		if err != nil { return err }
-
 		if *deploy.Spec.Replicas < needed {
-			log.Printf("[%s] Scaling UP: %d -> %d (Global Active Requests: High)", funcID, *deploy.Spec.Replicas, needed)
 			deploy.Spec.Replicas = &needed
 			_, err = clientset.AppsV1().Deployments(NAMESPACE).Update(context.TODO(), deploy, metav1.UpdateOptions{})
 			return err
@@ -157,7 +155,7 @@ func handleDeployAndRun(c *gin.Context) {
 	}
 
 	saveFunctionToRedis(req, funcID)
-	lastActivity.Store(funcID, time.Now())
+	updateLastActivity(funcID)
 	ensureK8sResources(c, funcID, req, bodyBytes)
 }
 
@@ -165,10 +163,9 @@ func handleInvoke(c *gin.Context) {
 	funcID := c.Param("name")
 	bodyBytes, _ := io.ReadAll(c.Request.Body)
 	
-	// 활동 시간 갱신
-	lastActivity.Store(funcID, time.Now())
-	
-	// 서비스 확인
+	// Redis 시간 갱신
+	updateLastActivity(funcID)
+
 	_, err := clientset.CoreV1().Services(NAMESPACE).Get(context.TODO(), funcID, metav1.GetOptions{})
 	if errors.IsNotFound(err) {
 		meta, err := getFunctionFromRedis(funcID)
@@ -177,7 +174,6 @@ func handleInvoke(c *gin.Context) {
 		ensureK8sResources(c, funcID, req, bodyBytes)
 		return
 	}
-
 	target := fmt.Sprintf("http://%s.%s.svc.cluster.local:8080", funcID, NAMESPACE)
 	proxyRequest(c, funcID, target, bodyBytes)
 }
@@ -192,23 +188,23 @@ func ensureK8sResources(c *gin.Context, funcID string, req FunctionRequest, body
 	proxyRequest(c, funcID, target, bodyBytes)
 }
 
-
 func createK8sResources(name string, req FunctionRequest) error {
 	ctx := context.TODO()
-
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: name}, Data: map[string]string{"user_code.py": req.Code}}
 	clientset.CoreV1().ConfigMaps(NAMESPACE).Create(ctx, cm, metav1.CreateOptions{})
 
 	memReq := resource.MustParse("128Mi")
 	targetLabel := "small"
-	if req.Request == "large-memory" { memReq = resource.MustParse("1Gi"); targetLabel = "large" }
+	if req.Request == "large-memory" { 
+		memReq = resource.MustParse("1Gi")
+		targetLabel = "large" 
+	}
 
 	replicas := int32(1)
-
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: &replicas, 
+			Replicas: &replicas,
 			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": name}},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": name}},
@@ -219,16 +215,44 @@ func createK8sResources(name string, req FunctionRequest) error {
 						Name:            "runner",
 						Image:           RUNNER_IMAGE,
 						ImagePullPolicy: corev1.PullNever,
-						Ports:           []corev1.ContainerPort{{ContainerPort: 8080}},
-						Resources:       corev1.ResourceRequirements{Requests: corev1.ResourceList{"memory": memReq}},
-						VolumeMounts:    []corev1.VolumeMount{{Name: "code-vol", MountPath: "/app/user_code.py", SubPath: "user_code.py"}},
+						Ports:           []corev1.ContainerPort{
+							{ContainerPort: 8080}
+						},
+						Resources: corev1.ResourceRequirements{
+							Requests: corev1.ResourceList{
+								"memory": memReq
+							}
+						},
+						VolumeMounts:    []corev1.VolumeMount{
+							{
+								Name: "code-vol", 
+								MountPath: "/app/user_code.py", 
+								SubPath: "user_code.py"
+							}
+						},
 						ReadinessProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{HTTPGet: &corev1.HTTPGetAction{Path: "/", Port: intstr.FromInt(8080)}},
-							InitialDelaySeconds: 1,
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path: "/", 
+									Port: intstr.FromInt(8080)
+								}
+							},
+							InitialDelaySeconds: 1, 
 							PeriodSeconds: 1,
 						},
 					}},
-					Volumes: []corev1.Volume{{Name: "code-vol", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: name}}}}},
+					Volumes: []corev1.Volume{
+						{
+							Name: "code-vol", 
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: name
+									}
+								}
+							}
+						}
+					},
 				},
 			},
 		},
@@ -246,51 +270,52 @@ func createK8sResources(name string, req FunctionRequest) error {
 
 func startIdleMonitor() {
 	ticker := time.NewTicker(MONITOR_PERIOD)
+	ctx := context.Background()
+	
 	for range ticker.C {
 		now := time.Now()
-		lastActivity.Range(func(key, value interface{}) bool {
-			funcID := key.(string)
-			lastTime := value.(time.Time)
+		
+		// 'last_active:*' 키 검색
+		iter := rdb.Scan(ctx, 0, "last_active:*", 0).Iterator()
+		for iter.Next(ctx) {
+			key := iter.Val() // last_active:func-abc
+			funcID := key[12:] // "func-abc" 추출
+
+			val, _ := rdb.Get(ctx, key).Result()
+			lastTime, _ := time.Parse(time.RFC3339, val)
+
 			if now.Sub(lastTime) > IDLE_TIMEOUT {
-				log.Printf("[%s] IDLE timeout. Deleting...", funcID)
+				// timeout
+				log.Printf("[%s] IDLE timeout. Deleting K8s Resources...", funcID)
 				deleteK8sResources(funcID)
-				lastActivity.Delete(funcID)
-				rdb.Del(context.Background(), fmt.Sprintf("active:%s", funcID))
+				
+				// Redis 카운터 및 시간 정보 삭제
+				rdb.Del(ctx, key) 
+				rdb.Del(ctx, fmt.Sprintf("active:%s", funcID))
 			}
-			return true
-		})
+		}
 	}
 }
 
 func deleteK8sResources(name string) error {
-    ctx := context.TODO()
-    delOpt := metav1.DeleteOptions{}
-    clientset.AppsV1().Deployments(NAMESPACE).Delete(ctx, name, delOpt)
-    clientset.CoreV1().Services(NAMESPACE).Delete(ctx, name, delOpt)
-    clientset.CoreV1().ConfigMaps(NAMESPACE).Delete(ctx, name, delOpt)
-    return nil
+	ctx := context.TODO()
+	delOpt := metav1.DeleteOptions{}
+	clientset.AppsV1().Deployments(NAMESPACE).Delete(ctx, name, delOpt)
+	clientset.CoreV1().Services(NAMESPACE).Delete(ctx, name, delOpt)
+	clientset.CoreV1().ConfigMaps(NAMESPACE).Delete(ctx, name, delOpt)
+	return nil
 }
 
-func waitForPodReady(funcID string) bool {
-    serviceName := fmt.Sprintf("%s.%s.svc.cluster.local:8080", funcID, NAMESPACE)
-    timeout := 30 * time.Second
-    start := time.Now()
-	
-	log.Printf("[%s] Waiting for TCP connection...", funcID)
-
-    for {
-        if time.Since(start) > timeout {
-            return false
-        }
-
-        conn, err := net.DialTimeout("tcp", serviceName, 500*time.Millisecond)
-        if err == nil {
-            conn.Close()
-            return true 
-        }
-
-        time.Sleep(100 * time.Millisecond)
-    }
+func waitForPodReady(name string) bool {
+	targetAddr := fmt.Sprintf("%s.%s.svc.cluster.local:8080", name, NAMESPACE)
+	timeout := 30 * time.Second
+	start := time.Now()
+	for {
+		if time.Since(start) > timeout { return false }
+		conn, err := net.DialTimeout("tcp", targetAddr, 200*time.Millisecond)
+		if err == nil { conn.Close(); return true }
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func proxyRequest(c *gin.Context, funcID string, target string, bodyBytes []byte) {
@@ -299,10 +324,7 @@ func proxyRequest(c *gin.Context, funcID string, target string, bodyBytes []byte
 
 	remote, _ := url.Parse(target)
 	proxy := httputil.NewSingleHostReverseProxy(remote)
-	proxy.Transport = &http.Transport{
-		DisableKeepAlives: false,
-        MaxIdleConnsPerHost: 10,
-	}
+	proxy.Transport = &http.Transport{DisableKeepAlives: false, MaxIdleConnsPerHost: 10}
 
 	originalDirector := proxy.Director
 	proxy.Director = func(req *http.Request) {
