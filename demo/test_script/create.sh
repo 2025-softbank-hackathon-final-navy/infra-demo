@@ -1,4 +1,4 @@
-curl -X POST http://10.2.0.204:31779/run \
+curl -X POST http://10.0.1.202:30674/run \
 -H "Content-Type: application/json" \
 -d '{
     "name": "test2", 

@@ -16,10 +16,17 @@ spec:
       serviceAccountName: gateway-sa 
       containers:
         - name: gateway
-          image: localhost/gateway:latest 
-          imagePullPolicy: Never
+          image: public.ecr.aws/l2r2n3p5/serverless-faas-dispatcher:latest
+          imagePullPolicy: Always  # ECR에서 항상 이미지 Pull
           ports:
             - containerPort: 80
+          env:
+            - name: REDIS_ENDPOINT
+              value: "REPLACE_WITH_REDIS_ENDPOINT"  # Update after terraform apply
+            - name: S3_BUCKET_NAME
+              value: "REPLACE_WITH_S3_BUCKET_NAME"  # Update after terraform apply
+            - name: AWS_REGION
+              value: "ap-northeast-1"
           resources:
             requests:
               memory: "256Mi"
@@ -41,3 +48,4 @@ spec:
     - protocol: TCP
       port: 80
       targetPort: 80
+      nodePort: 30080  # 고정 NodePort

@@ -12,11 +12,17 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -28,32 +34,77 @@ import (
 )
 
 const (
-	IDLE_TIMEOUT   = 1 * time.Minute 
+	IDLE_TIMEOUT   = 10 * time.Minute // Increased from 1 min to support warm starts
 	MONITOR_PERIOD = 1 * time.Minute
-	RUNNER_IMAGE   = "localhost/py-runner:latest" 
+	RUNNER_IMAGE   = "public.ecr.aws/l2r2n3p5/serverless-faas-worker-python:latest"
 	NAMESPACE      = "default"
 )
 
 var (
-	clientset    *kubernetes.Clientset
-	lastActivity sync.Map
-	// K8s 리소스 이름 유효성 검사 (소문자, 숫자, 하이픈)
+	clientset      *kubernetes.Clientset
+	redisClient    *redis.Client
+	s3Client       *s3.Client
+	s3BucketName   string
+	awsRegion      string
+	lastActivity   sync.Map
 	validNameRegex = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 )
 
 type FunctionRequest struct {
-	Name    string `json:"name"` 
+	Name    string `json:"name"`
 	Code    string `json:"code"`
 	Type    string `json:"type"`
 	Request string `json:"request"`
 }
 
+type FunctionMetadata struct {
+	S3Key     string    `json:"s3_key"`
+	PodName   string    `json:"pod_name"`
+	Status    string    `json:"status"` // "active", "idle", "terminated"
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 func main() {
-	config, err := rest.InClusterConfig()
+	// Initialize K8s client
+	k8sConfig, err := rest.InClusterConfig()
 	if err != nil {
 		panic(err)
 	}
-	clientset, _ = kubernetes.NewForConfig(config)
+	clientset, _ = kubernetes.NewForConfig(k8sConfig)
+
+	// Initialize environment variables
+	s3BucketName = os.Getenv("S3_BUCKET_NAME")
+	awsRegion = os.Getenv("AWS_REGION")
+	redisEndpoint := os.Getenv("REDIS_ENDPOINT")
+
+	if s3BucketName == "" || awsRegion == "" || redisEndpoint == "" {
+		log.Fatal("Missing required environment variables: S3_BUCKET_NAME, AWS_REGION, REDIS_ENDPOINT")
+	}
+
+	// Initialize AWS SDK
+	awsConfig, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(awsRegion))
+	if err != nil {
+		log.Fatalf("Failed to load AWS config: %v", err)
+	}
+	s3Client = s3.NewFromConfig(awsConfig)
+
+	// Initialize Redis client
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:     redisEndpoint,
+		Password: "", // ElastiCache Redis doesn't use password by default
+		DB:       0,
+	})
+
+	// Test Redis connection
+	ctx := context.Background()
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
+	log.Println("Connected to Redis successfully")
+
+	// Restore state from Redis
+	restoreStateFromRedis(ctx)
 
 	go startIdleMonitor()
 
@@ -61,12 +112,19 @@ func main() {
 
 	r.POST("/run", handleDeployAndRun)
 	r.POST("/invoke/:name", handleInvoke)
+	r.GET("/metrics/:name", handleMetrics)
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok"})
+	})
 
 	log.Println("Serverless Gateway started on :80")
 	r.Run(":80")
 }
 
 func handleDeployAndRun(c *gin.Context) {
+	ctx := context.TODO()
+	startTime := time.Now()
+
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(400, gin.H{"error": "Failed to read body"})
@@ -81,84 +139,144 @@ func handleDeployAndRun(c *gin.Context) {
 
 	var funcID string
 	if req.Name != "" {
-		// 사용자가 이름을 지정한 경우
 		if !validNameRegex.MatchString(req.Name) {
 			c.JSON(400, gin.H{"error": "Invalid function name. Use lowercase, numbers, hyphens."})
 			return
 		}
 		funcID = req.Name
 	} else {
-		// 이름이 없으면 해시 생성, 쓰면 안됨;
 		hash := sha256.Sum256([]byte(req.Code))
 		funcID = "func-" + hex.EncodeToString(hash[:])[:10]
 	}
 
-	// 활동 시간 갱신
 	lastActivity.Store(funcID, time.Now())
 
-	// 서비스 존재 확인 -> 없으면 생성 (Cold Start)
-	_, err = clientset.CoreV1().Services(NAMESPACE).Get(context.TODO(), funcID, metav1.GetOptions{})
-	if errors.IsNotFound(err) {
-		log.Printf("[%s] Cold Start / Deploying...", funcID)
-		if err := createK8sResources(funcID, req); err != nil {
+	// Check Redis for existing function metadata (Warm Start Check)
+	metadataKey := fmt.Sprintf("function:%s", funcID)
+	isWarmStart := false
+	var metadata FunctionMetadata
+
+	metadataJSON, err := redisClient.Get(ctx, metadataKey).Result()
+	if err == nil {
+		// Function exists in Redis - check if pod is still running
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err == nil {
+			_, err := clientset.CoreV1().Pods(NAMESPACE).Get(ctx, metadata.PodName, metav1.GetOptions{})
+			if err == nil {
+				// Pod exists and running - WARM START!
+				isWarmStart = true
+				log.Printf("[%s] Warm Start - Reusing existing pod", funcID)
+			}
+		}
+	}
+
+	// Cold Start - need to create resources
+	if !isWarmStart {
+		log.Printf("[%s] Cold Start - Creating new resources", funcID)
+
+		// Upload code to S3
+		s3Key := fmt.Sprintf("functions/%s.py", funcID)
+		_, err := s3Client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(s3BucketName),
+			Key:    aws.String(s3Key),
+			Body:   bytes.NewReader([]byte(req.Code)),
+		})
+		if err != nil {
+			log.Printf("[%s] Failed to upload to S3: %v", funcID, err)
+			c.JSON(500, gin.H{"error": "Failed to upload code to S3"})
+			return
+		}
+		log.Printf("[%s] Uploaded code to S3: %s", funcID, s3Key)
+
+		// Create K8s resources (Deployment, Service) - NO ConfigMap
+		if err := createK8sResources(funcID, req, s3Key); err != nil {
 			c.JSON(500, gin.H{"error": "Failed to create resources: " + err.Error()})
 			return
 		}
+
+		// Wait for pod to be ready
 		if !waitForPodReady(funcID) {
 			c.JSON(504, gin.H{"error": "Timeout waiting for pod"})
 			return
 		}
+
+		// Save metadata to Redis
+		metadata = FunctionMetadata{
+			S3Key:     s3Key,
+			PodName:   funcID,
+			Status:    "active",
+			CreatedAt: time.Now(),
+			UpdatedAt: time.Now(),
+		}
+		metadataBytes, _ := json.Marshal(metadata)
+		redisClient.Set(ctx, metadataKey, metadataBytes, 0)
+		redisClient.SAdd(ctx, "active_functions", funcID)
+		log.Printf("[%s] Saved metadata to Redis", funcID)
+	} else {
+		// Update Redis metadata for warm start
+		metadata.UpdatedAt = time.Now()
+		metadata.Status = "active"
+		metadataBytes, _ := json.Marshal(metadata)
+		redisClient.Set(ctx, metadataKey, metadataBytes, 0)
 	}
 
-	// 실행
+	// Execute function
 	target := fmt.Sprintf("http://%s.%s.svc.cluster.local:8080", funcID, NAMESPACE)
 	proxyRequest(c, target, bodyBytes)
+
+	// Track metrics
+	duration := time.Since(startTime).Seconds()
+	updateMetrics(ctx, funcID, duration, true, isWarmStart)
 }
 
 
 func handleInvoke(c *gin.Context) {
-	funcID := c.Param("name") 
+	ctx := context.TODO()
+	startTime := time.Now()
+	funcID := c.Param("name")
+
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		c.JSON(400, gin.H{"error": "Failed to read body"})
 		return
 	}
 
-	// 함수가 존재하는지 확인
-	_, err = clientset.CoreV1().Services(NAMESPACE).Get(context.TODO(), funcID, metav1.GetOptions{})
-	if errors.IsNotFound(err) {
-		// 함수가 없으면 404 리턴
+	// Check if function exists in Redis
+	metadataKey := fmt.Sprintf("function:%s", funcID)
+	_, err = redisClient.Get(ctx, metadataKey).Result()
+	if err == redis.Nil {
 		c.JSON(404, gin.H{"error": fmt.Sprintf("Function '%s' not found. Please deploy it first via /run", funcID)})
+		return
+	} else if err != nil {
+		c.JSON(500, gin.H{"error": "Redis error"})
+		return
+	}
+
+	// Check if pod still exists
+	_, err = clientset.CoreV1().Services(NAMESPACE).Get(ctx, funcID, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		c.JSON(404, gin.H{"error": fmt.Sprintf("Function '%s' pod not found. Please redeploy via /run", funcID)})
 		return
 	} else if err != nil {
 		c.JSON(500, gin.H{"error": "K8s API Error"})
 		return
 	}
 
-	// 활동 시간 갱신 
 	lastActivity.Store(funcID, time.Now())
 
-	// 실행 요청 포워딩
 	target := fmt.Sprintf("http://%s.%s.svc.cluster.local:8080", funcID, NAMESPACE)
 	proxyRequest(c, target, bodyBytes)
+
+	// Track metrics
+	duration := time.Since(startTime).Seconds()
+	updateMetrics(ctx, funcID, duration, true, true) // invoke always uses warm start
 }
 
-func createK8sResources(name string, req FunctionRequest) error {
+func createK8sResources(name string, req FunctionRequest, s3Key string) error {
 	ctx := context.TODO()
 
-	// 1. ConfigMap (이미 있으면 업데이트)
-	cm := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: name},
-		Data:       map[string]string{"user_code.py": req.Code},
-	}
-	
-	_, err := clientset.CoreV1().ConfigMaps(NAMESPACE).Create(ctx, cm, metav1.CreateOptions{})
-	if errors.IsAlreadyExists(err) {
-		_, err = clientset.CoreV1().ConfigMaps(NAMESPACE).Update(ctx, cm, metav1.UpdateOptions{})
-	}
-	if err != nil { return err }
+	// NO MORE ConfigMap - code is in S3!
 
-	// 2. Deployment
+	// 1. Deployment with S3 environment variables
 	memReq := resource.MustParse("128Mi")
 	if req.Request == "large-memory" {
 		memReq = resource.MustParse("1Gi")
@@ -175,26 +293,28 @@ func createK8sResources(name string, req FunctionRequest) error {
 					Containers: []corev1.Container{{
 						Name:            "runner",
 						Image:           RUNNER_IMAGE,
-						ImagePullPolicy: corev1.PullNever, // ECR 환경이면 지우기
+						ImagePullPolicy: corev1.PullAlways,
 						Ports:           []corev1.ContainerPort{{ContainerPort: 8080}},
 						Resources:       corev1.ResourceRequirements{Requests: corev1.ResourceList{"memory": memReq}},
-						VolumeMounts: []corev1.VolumeMount{{
-							Name: "code-vol", MountPath: "/app/user_code.py", SubPath: "user_code.py",
-						}},
+						Env: []corev1.EnvVar{
+							{Name: "S3_BUCKET_NAME", Value: s3BucketName},
+							{Name: "S3_KEY", Value: s3Key},
+							{Name: "AWS_REGION", Value: awsRegion},
+						},
+						// NO MORE VolumeMounts - code downloaded from S3
 					}},
-					Volumes: []corev1.Volume{{
-						Name: "code-vol",
-						VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: name}}},
-					}},
+					// NO MORE Volumes
 				},
 			},
 		},
 	}
-	
-	_, err = clientset.AppsV1().Deployments(NAMESPACE).Create(ctx, deploy, metav1.CreateOptions{})
-	if err != nil && !errors.IsAlreadyExists(err) { return err }
 
-	// 3. Service
+	_, err := clientset.AppsV1().Deployments(NAMESPACE).Create(ctx, deploy, metav1.CreateOptions{})
+	if err != nil && !errors.IsAlreadyExists(err) {
+		return err
+	}
+
+	// 2. Service
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Spec: corev1.ServiceSpec{
@@ -203,7 +323,9 @@ func createK8sResources(name string, req FunctionRequest) error {
 		},
 	}
 	_, err = clientset.CoreV1().Services(NAMESPACE).Create(ctx, svc, metav1.CreateOptions{})
-	if err != nil && !errors.IsAlreadyExists(err) { return err }
+	if err != nil && !errors.IsAlreadyExists(err) {
+		return err
+	}
 
 	return nil
 }
@@ -243,9 +365,20 @@ func startIdleMonitor() {
 func deleteK8sResources(name string) error {
 	ctx := context.TODO()
 	delOpt := metav1.DeleteOptions{}
+
+	// Delete K8s resources
 	clientset.AppsV1().Deployments(NAMESPACE).Delete(ctx, name, delOpt)
 	clientset.CoreV1().Services(NAMESPACE).Delete(ctx, name, delOpt)
-	clientset.CoreV1().ConfigMaps(NAMESPACE).Delete(ctx, name, delOpt)
+	// NO MORE ConfigMap deletion
+
+	// Delete Redis metadata
+	metadataKey := fmt.Sprintf("function:%s", name)
+	redisClient.Del(ctx, metadataKey)
+	redisClient.SRem(ctx, "active_functions", name)
+
+	// Keep metrics for historical purposes (don't delete)
+
+	log.Printf("[%s] Cleaned up resources and Redis metadata", name)
 	return nil
 }
 
@@ -272,6 +405,92 @@ func proxyRequest(c *gin.Context, target string, bodyBytes []byte) {
 		},
 	}
 	proxy.ServeHTTP(c.Writer, c.Request)
+}
+
+func restoreStateFromRedis(ctx context.Context) {
+	log.Println("Restoring state from Redis...")
+
+	// Get all active functions
+	functions, err := redisClient.SMembers(ctx, "active_functions").Result()
+	if err != nil {
+		log.Printf("Failed to restore active functions: %v", err)
+		return
+	}
+
+	for _, funcID := range functions {
+		metadataKey := fmt.Sprintf("function:%s", funcID)
+		metadataJSON, err := redisClient.Get(ctx, metadataKey).Result()
+		if err != nil {
+			continue
+		}
+
+		var metadata FunctionMetadata
+		if err := json.Unmarshal([]byte(metadataJSON), &metadata); err != nil {
+			continue
+		}
+
+		// Verify pod still exists
+		_, err = clientset.CoreV1().Pods(NAMESPACE).Get(ctx, metadata.PodName, metav1.GetOptions{})
+		if err == nil {
+			// Pod exists - restore to memory
+			lastActivity.Store(funcID, metadata.UpdatedAt)
+			log.Printf("Restored: Function=%s, Pod=%s, S3Key=%s", funcID, metadata.PodName, metadata.S3Key)
+		} else {
+			// Pod doesn't exist - clean up stale metadata
+			log.Printf("Cleaning stale metadata for function=%s (pod not found)", funcID)
+			redisClient.Del(ctx, metadataKey)
+			redisClient.SRem(ctx, "active_functions", funcID)
+		}
+	}
+
+	log.Printf("State restoration complete. Active functions: %d", len(functions))
+}
+
+func updateMetrics(ctx context.Context, funcID string, duration float64, success bool, isWarmStart bool) {
+	metricsKey := fmt.Sprintf("metrics:%s", funcID)
+
+	// Increment execution count
+	redisClient.HIncrBy(ctx, metricsKey, "exec_count", 1)
+
+	// Update last run time
+	redisClient.HSet(ctx, metricsKey, "last_run_time", time.Now().Format(time.RFC3339))
+
+	// Accumulate total duration
+	redisClient.HIncrByFloat(ctx, metricsKey, "total_duration", duration)
+
+	// Track success/failure
+	if success {
+		redisClient.HIncrBy(ctx, metricsKey, "success_count", 1)
+	} else {
+		redisClient.HIncrBy(ctx, metricsKey, "error_count", 1)
+	}
+
+	// Track warm/cold starts
+	if isWarmStart {
+		redisClient.HIncrBy(ctx, metricsKey, "warm_start_count", 1)
+	} else {
+		redisClient.HIncrBy(ctx, metricsKey, "cold_start_count", 1)
+	}
+
+	// Set TTL to 7 days
+	redisClient.Expire(ctx, metricsKey, 7*24*time.Hour)
+}
+
+func handleMetrics(c *gin.Context) {
+	ctx := context.TODO()
+	funcID := c.Param("name")
+	metricsKey := fmt.Sprintf("metrics:%s", funcID)
+
+	metrics, err := redisClient.HGetAll(ctx, metricsKey).Result()
+	if err != nil || len(metrics) == 0 {
+		c.JSON(404, gin.H{"error": "No metrics found for this function"})
+		return
+	}
+
+	c.JSON(200, gin.H{
+		"function": funcID,
+		"metrics":  metrics,
+	})
 }
 
 func stringPtr(s string) *string { return &s }
