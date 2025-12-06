@@ -6,6 +6,7 @@ RUN pip install pandas
 RUN pip install boto3
 RUN pip install pydantic
 RUN pip install httpx
+RUN pip install psutil
 
 WORKDIR /app
 COPY runner.py /app/runner.py
