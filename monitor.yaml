@@ -481,6 +481,27 @@ spec:
       targetPort: 3000
       nodePort: 30004
 ---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana
+  namespace: monitoring
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: grafana.gyungdal.cc
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: grafana
+            port:
+              number: 3000
 
-# http://prometheus-server.monitoring.svc.cluster.local:9090
+# http://prometheus-service.monitoring.svc.cluster.local:8080
 # kubectl port-forward -n monitoring svc/grafana 3000:3000
+# https://gruuuuu.hololy.org/cloud/monitoring-02/#datasource-%EC%B6%94%EA%B0%80
